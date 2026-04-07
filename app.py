@@ -16,12 +16,14 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = "cache"
+# Đảm bảo đường dẫn tuyệt đối để chạy ổn định trên Linux/Systemd
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
 MAX_CACHE_SIZE = 10 * 1024 * 1024 * 1024  # 10 GB
 MAX_CACHE_AGE = 30 * 24 * 60 * 60        # 30 ngày (giây)
 
 if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 async def prune_cache():
     """Tự động dọn dẹp cache: xóa file cũ > 30 ngày và đảm bảo tổng dung lượng < 10GB"""
@@ -68,8 +70,8 @@ async def startup_event():
     asyncio.create_task(prune_cache())
 
 
-# Khởi tạo Jinja2 templates (thư mục chứa giao diện web)
-templates = Jinja2Templates(directory="templates")
+# Khởi tạo Jinja2 templates với đường dẫn tuyệt đối
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 # Cho phép CORS để Player JS có thể truy cập streams từ bất kì đâu (quan trọng khi share link)
 app.add_middleware(
@@ -94,7 +96,7 @@ def make_proxy_url(request: Request, path: str, target_url: str) -> str:
 @app.get("/")
 async def root(request: Request):
     """Trang chủ - giao diện Player"""
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 @app.get("/proxy/m3u8")
 async def proxy_m3u8(request: Request, url: str):

@@ -13,7 +13,7 @@ echo "======================================="
 # Đường dẫn cài đặt chuẩn
 INSTALL_DIR="/var/www/m3u8player"
 SERVICE_NAME="m3u8player"
-PORT="8000"  #
+PORT="6969"  #
 
 # 1. Phát hiện hệ điều hành và trình quản lý gói
 echo "[1/6] Đang kiểm tra hệ điều hành và cài đặt dependencies..."
