@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+httpx
+m3u8
+jinja2
+aiofiles

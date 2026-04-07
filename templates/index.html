@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ M3U8 Turbo Proxy Player</title>
+    <!-- Thêm phông chữ hiện đại của Google -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- HLS.js cho thiết bị không Apple -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        :root {
+            --bg-color: #0f111a;
+            /* Sang trọng, tối */
+            --glass-bg: rgba(255, 255, 255, 0.05);
+            --glass-border: rgba(255, 255, 255, 0.1);
+            --accent-color: #6366f1;
+            /* Indigo hiện đại */
+            --accent-hover: #4f46e5;
+            --text-main: #f3f4f6;
+            --text-dim: #9ca3af;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-image: radial-gradient(circle at top, rgba(99, 102, 241, 0.15), transparent 60%);
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+            padding: 2rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            animation: fadeIn 0.8s ease-out forwards;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 1rem;
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #a5b4fc, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        p.subtitle {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+            max-width: 500px;
+            margin: 0 auto;
+            line-height: 1.5;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 0.75rem;
+            background: var(--glass-bg);
+            padding: 0.5rem;
+            border-radius: 999px;
+            /* Nút hình oval hiện đại */
+            border: 1px solid var(--glass-border);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            transition: var(--transition);
+        }
+
+        .input-group:focus-within {
+            border-color: rgba(99, 102, 241, 0.5);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+
+        input[type="url"] {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            font-size: 1rem;
+            padding: 0.5rem 1rem;
+            outline: none;
+            font-family: monospace;
+        }
+
+        input[type="url"]::placeholder {
+            color: #6b7280;
+            font-family: 'Inter', sans-serif;
+        }
+
+        button {
+            background-color: var(--accent-color);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 999px;
+            font-weight: 600;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        button:hover {
+            background-color: var(--accent-hover);
+            transform: scale(1.02);
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        .video-container {
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #000;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.2);
+            position: relative;
+            border: 1px solid var(--glass-border);
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+
+        .status {
+            text-align: center;
+            font-size: 0.9rem;
+            color: var(--text-dim);
+            min-height: 1.5em;
+        }
+
+        /* Tối ưu điện thoại */
+        @media (max-width: 600px) {
+            .input-group {
+                flex-direction: column;
+                border-radius: 16px;
+                padding: 1rem;
+            }
+
+            .input-group:focus-within {
+                border-radius: 16px;
+            }
+
+            input[type="url"] {
+                padding: 0.5rem 0;
+            }
+
+            button {
+                width: 100%;
+                border-radius: 8px;
+            }
+
+            h1 {
+                font-size: 1.8rem;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Turbo M3U8 Proxy</h1>
+            <p class="subtitle">Dán link M3U8 vào đây.</p>
+        </header>
+
+        <form id="playerForm" class="input-group">
+            <input type="url" id="m3u8Link" placeholder="https://domain.com/video/index.m3u8" required>
+            <button type="submit">
+                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M8 5v14l11-7z" />
+                </svg>
+                Phát Video
+            </button>
+        </form>
+
+        <div class="status" id="statusMessage">Đang chờ link video...</div>
+
+        <div class="video-container">
+            <!-- 
+               Sử dụng thẻ Video thông thường.
+               iOS / Safari: Native player tự nhận format m3u8 (cực xịn cho Airplay).
+               Desktop Chrome: sẽ dùng javascript hls.js hỗ trợ.
+               playsinline: Cần thiết để play không tự động fullscreen trên iOS.
+            -->
+            <video id="videoPlayer" controls playsinline>
+                Trình duyệt của bạn không hỗ trợ thẻ video.
+            </video>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('playerForm');
+        const input = document.getElementById('m3u8Link');
+        const video = document.getElementById('videoPlayer');
+        const status = document.getElementById('statusMessage');
+        let hlsObj = null;
+
+        form.addEventListener('submit', function (e) {
+            e.preventDefault();
+            const originalUrl = input.value.trim();
+            if (!originalUrl) return;
+
+            // Xây dựng đường dẫn trỏ về Server Proxy của chúng ta
+            const proxyUrl = `/proxy/m3u8?url=${encodeURIComponent(originalUrl)}`;
+
+            status.textContent = 'Đang tải luồng video qua Server Proxy...';
+
+            // Dọn dẹp HLS cũ nếu đang chạy
+            if (hlsObj) {
+                hlsObj.destroy();
+                hlsObj = null;
+            }
+
+            // Xử lý phát Video
+            // Cách 1: Native (Thiết bị Apple/Safari có hỗ trợ)
+            if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = proxyUrl;
+                video.addEventListener('loadedmetadata', function () {
+                    video.play().catch(e => console.log("Lỗi autoplay", e));
+                    status.innerHTML = 'Đang chạy qua <b>Native Player (AirPlay hỗ trợ)</b> 🚀';
+                }, { once: true });
+            }
+            // Cách 2: Trình duyệt khác (Chrome, Firefox, Android)
+            else if (Hls.isSupported()) {
+                hlsObj = new Hls({
+                    // Tuning config cho mượt 
+                    maxBufferLength: 30,
+                    maxMaxBufferLength: 600,
+                });
+
+                hlsObj.loadSource(proxyUrl);
+                hlsObj.attachMedia(video);
+
+                hlsObj.on(Hls.Events.MANIFEST_PARSED, function () {
+                    video.play().catch(e => console.log("Lỗi autoplay", e));
+                    status.innerHTML = 'Đang chạy qua <b>HLS.js</b> ⚡';
+                });
+
+                hlsObj.on(Hls.Events.ERROR, function (event, data) {
+                    if (data.fatal) {
+                        status.innerHTML = `<span style="color: #ef4444">Lỗi: Tải luồng từ server (Kiểm tra lại link)</span>`;
+                        console.error('HLS Error: ', data);
+                    }
+                });
+            } else {
+                status.textContent = 'Trình duyệt của bạn không hỗ trợ phát dạng M3U8.';
+            }
+        });
+    </script>
+</body>
+
+</html>
