@@ -1,20 +1,26 @@
 import m3u8
 import urllib.parse
+from urllib.parse import urljoin, quote
 import hashlib
 import os
 import aiofiles
 import shutil
 import time
 import asyncio
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import StreamingResponse, PlainTextResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import httpx
 import logging
+from urllib.parse import urljoin, quote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Quản lý các tiến trình đang tải (Single Flight) để chống tải trùng
+download_locks = {} 
 
 # Đảm bảo đường dẫn tuyệt đối để chạy ổn định trên Linux/Systemd
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +70,9 @@ async def prune_cache():
 
 app = FastAPI(title="M3U8 Proxy Player")
 
+# Phục vụ các file tĩnh (manifest, icons)
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
 @app.on_event("startup")
 async def startup_event():
     # Khởi động tác vụ dọn dẹp cache ngầm
@@ -73,7 +82,7 @@ async def startup_event():
 # Khởi tạo Jinja2 templates với đường dẫn tuyệt đối
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
-# Cho phép CORS để Player JS có thể truy cập streams từ bất kì đâu (quan trọng khi share link)
+# Cho phép CORS để Player JS có thể truy cập streams từ bất kì đâu
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -83,9 +92,7 @@ app.add_middleware(
 )
 
 # HTTP client dùng để proxy
-# Thiết lập limits và timeout tối ưu cho proxy video
-limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
-client = httpx.AsyncClient(limits=limits)
+client = httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True)
 
 def make_proxy_url(request: Request, path: str, target_url: str) -> str:
     """Tạo URL đi qua proxy của chúng ta"""
@@ -107,43 +114,34 @@ async def proxy_m3u8(request: Request, url: str):
         response.raise_for_status()
         
         # Phân tích nội dung M3U8 với thư viện m3u8
-        # uri=url giúp m3u8 tự động hiểu các đường dẫn relative bên trong
         playlist = m3u8.loads(response.text, uri=url)
         
-        # Phân nhánh 1: Nếu là luồng MASTER (chứa độ phân giải khác nhau)
+        # Phân nhánh 1: Nếu là luồng MASTER
         if playlist.is_variant:
-            # Sửa các variant playlist
             for item in playlist.playlists:
                 abs_uri = item.absolute_uri
                 item.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri)
-                
-            # Sửa iframe playlists (nếu có)
             if playlist.iframe_playlists:
                 for iframe in playlist.iframe_playlists:
                     abs_uri = iframe.absolute_uri
                     iframe.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri)
-                    
-            # Sửa các thẻ media (âm thanh, phụ đề)
             if playlist.media:
                 for media in playlist.media:
                     if media.uri:
                         abs_uri = media.absolute_uri
                         media.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri)
                         
-        # Phân nhánh 2: Nếu là luồng MEDIA (chứa file .TS Video)
+        # Phân nhánh 2: Nếu là luồng MEDIA
         else:
             for segment in playlist.segments:
                 abs_uri = segment.absolute_uri
-                # Các file ts sẽ được proxy tải qua nhánh /proxy/ts
                 segment.uri = make_proxy_url(request, "/proxy/ts", abs_uri)
                 
-            # Hỗ trợ proxy luôn cho file Khóa giải mã (hỗ trợ luồng mã hóa bảo mật)
             for key in playlist.keys:
                 if key and key.uri:
                     abs_uri = key.absolute_uri
                     key.uri = make_proxy_url(request, "/proxy/ts", abs_uri)
                     
-        # Trả về M3U8 đúng chuẩn để Player đọc
         return PlainTextResponse(
             playlist.dumps(), 
             media_type="application/vnd.apple.mpegurl",
@@ -154,55 +152,81 @@ async def proxy_m3u8(request: Request, url: str):
         logger.error(f"Error fetching proxy m3u8 '{url}': {e}")
         return PlainTextResponse(f"Proxy Error: {str(e)}", status_code=500)
 
-
 @app.get("/proxy/ts")
 async def proxy_ts(request: Request, url: str):
-    """Proxy stream và Cache các luồng video .TS"""
-    try:
-        # Tạo tên file cache từ mã băm URL
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        cache_path = os.path.join(CACHE_DIR, f"{url_hash}.ts")
-        
-        # Nếu đã có trong cache, trả về file ngay lập tức
+    """Proxy và cache .ts với cơ chế Single Flight chống tải trùng"""
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    cache_path = os.path.join(CACHE_DIR, f"{url_hash}.ts")
+    
+    # 1. Kiểm tra cache trên đĩa
+    if os.path.exists(cache_path):
+        return FileResponse(cache_path, media_type="video/MP2T", headers={"X-Cache": "HIT"})
+    
+    # 2. Cơ chế Single Flight: Kiểm tra xem có ai đang tải đoạn này chưa
+    if url_hash in download_locks:
+        # Đang có người tải, đợi họ tải xong
+        await download_locks[url_hash].wait()
+        # Sau khi đợi xong, file chắc chắn đã có trên đĩa
         if os.path.exists(cache_path):
-            return FileResponse(
-                cache_path, 
-                media_type="video/mp2t",
-                headers={"X-Cache": "HIT"}
-            )
+            return FileResponse(cache_path, media_type="video/MP2T", headers={"X-Cache": "HIT-QUEUED"})
 
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-        
-        async def stream_and_cache_generator():
-            temp_path = f"{cache_path}.tmp"
-            try:
-                async with client.stream("GET", url, headers=headers, follow_redirects=True) as response:
-                    response.raise_for_status()
-                    async with aiofiles.open(temp_path, mode='wb') as cache_file:
-                        async for chunk in response.aiter_bytes(chunk_size=65536):
-                            await cache_file.write(chunk)
-                            yield chunk
-                
-                # Sau khi tải xong, đổi tên từ .tmp thành .ts chính thức
-                os.rename(temp_path, cache_path)
-            except Exception as stream_err:
-                logger.error(f"Lỗi khi đang stream và cache: {stream_err}")
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-        return StreamingResponse(
-            stream_and_cache_generator(),
-            media_type="video/mp2t",
-            headers={
-                "Cache-Control": "public, max-age=3600",
-                "X-Cache": "MISS"
-            }
-        )
-        
-    except httpx.HTTPError as he:
-        return PlainTextResponse(f"HTTP Error: {str(he)}", status_code=502)
+    # 3. Nếu chưa ai tải, tạo Lock và bắt đầu tải
+    event = asyncio.Event()
+    download_locks[url_hash] = event
+    
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            async with aiofiles.open(cache_path, "wb") as f:
+                await f.write(resp.content)
+            
+            # Giải phóng cho những yêu cầu đang đợi
+            event.set()
+            return Response(content=resp.content, media_type="video/MP2T", headers={"X-Cache": "MISS"})
+        else:
+            event.set() # Vẫn phải set để giải phóng hàng chờ cho dù lỗi
+            return PlainTextResponse("Error fetching segment", status_code=resp.status_code)
     except Exception as e:
+        event.set()
+        logger.error(f"Lỗi tải segment: {e}")
         return PlainTextResponse(f"Unknown Error: {str(e)}", status_code=500)
+    finally:
+        # Xóa lock sau khi hoàn tất
+        if url_hash in download_locks:
+            del download_locks[url_hash]
+
+@app.get("/api/cache/status")
+async def get_cache_status():
+    """Lấy thông tin dung lượng cache hiện tại"""
+    try:
+        total_size = 0
+        for file in os.listdir(CACHE_DIR):
+            file_path = os.path.join(CACHE_DIR, file)
+            if os.path.isfile(file_path):
+                total_size += os.path.getsize(file_path)
+        
+        percent = (total_size / MAX_CACHE_SIZE) * 100
+        total_gb = total_size / (1024 * 1024 * 1024)
+        
+        return {
+            "size_gb": round(total_gb, 2),
+            "percent": round(percent, 1),
+            "max_gb": 10
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/cache/clear")
+async def clear_cache_endpoint():
+    """Xóa sạch bộ nhớ đêm ngay lập tức"""
+    try:
+        for file in os.listdir(CACHE_DIR):
+            file_path = os.path.join(CACHE_DIR, file)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        return {"status": "success", "message": "Đã dọn sạch cache."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.on_event("shutdown")
 async def shutdown_event():
