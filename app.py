@@ -14,8 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import httpx
 import logging
-from urllib.parse import urljoin, quote
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -26,43 +24,64 @@ download_locks = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 MAX_CACHE_SIZE = 10 * 1024 * 1024 * 1024  # 10 GB
-MAX_CACHE_AGE = 30 * 24 * 60 * 60        # 30 ngày (giây)
+MAX_CACHE_AGE = 6 * 60 * 60              # 6 giờ (giây)
 
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+def _cleanup_disk():
+    now = time.time()
+    total_size = 0
+    cleaned_sessions = 0
+    all_files = []
+
+    for item in os.listdir(CACHE_DIR):
+        item_path = os.path.join(CACHE_DIR, item)
+        if os.path.isdir(item_path):
+            stats = os.stat(item_path)
+            if now - stats.st_mtime > MAX_CACHE_AGE:
+                try:
+                    shutil.rmtree(item_path)
+                    cleaned_sessions += 1
+                except Exception:
+                    pass
+            else:
+                for root, _, files in os.walk(item_path):
+                    for f in files:
+                        fpath = os.path.join(root, f)
+                        fstats = os.stat(fpath)
+                        total_size += fstats.st_size
+                        if not f.endswith(".part"):
+                            all_files.append((fpath, fstats.st_mtime, fstats.st_size))
+                        else:
+                            if now - fstats.st_mtime > 3600:
+                                try: os.remove(fpath)
+                                except: pass
+        else:
+            try: os.remove(item_path)
+            except: pass
+
+    if cleaned_sessions > 0:
+        logger.info(f"Đã xóa {cleaned_sessions} phiên làm việc (session) hết hạn.")
+
+    if total_size > MAX_CACHE_SIZE:
+        all_files.sort(key=lambda x: x[1])
+        removed_size = 0
+        for file_path, _, size in all_files:
+            if total_size - removed_size <= MAX_CACHE_SIZE:
+                break
+            try:
+                os.remove(file_path)
+                removed_size += size
+                logger.info(f"Đã xóa file lẻ cũ để giảm dung lượng: {file_path}")
+            except Exception:
+                pass
+
 async def prune_cache():
-    """Tự động dọn dẹp cache: xóa file cũ > 30 ngày và đảm bảo tổng dung lượng < 10GB"""
+    """Tự động dọn dẹp cache không block event loop"""
     while True:
         try:
-            now = time.time()
-            all_files = []
-            total_size = 0
-
-            # 1. Xóa file quá hạn 30 ngày
-            for file in os.listdir(CACHE_DIR):
-                file_path = os.path.join(CACHE_DIR, file)
-                if not os.path.isfile(file_path): continue
-                
-                stats = os.stat(file_path)
-                if now - stats.st_mtime > MAX_CACHE_AGE:
-                    os.remove(file_path)
-                    logger.info(f"Đã xóa cache hết hạn: {file}")
-                else:
-                    all_files.append((file_path, stats.st_mtime, stats.st_size))
-                    total_size += stats.st_size
-
-            # 2. Nếu vẫn vượt quá 10GB, xóa các file cũ nhất
-            if total_size > MAX_CACHE_SIZE:
-                # Sắp xếp theo thời gian sửa đổi (cũ nhất lên trước)
-                all_files.sort(key=lambda x: x[1])
-                for file_path, _, size in all_files:
-                    if total_size <= MAX_CACHE_SIZE:
-                        break
-                    os.remove(file_path)
-                    total_size -= size
-                    logger.info(f"Đã xóa cache cũ nhất (Vượt 10GB): {file_path}")
-
+            await asyncio.to_thread(_cleanup_disk)
         except Exception as e:
             logger.error(f"Lỗi dọn dẹp cache: {e}")
             
@@ -94,11 +113,14 @@ app.add_middleware(
 # HTTP client dùng để proxy
 client = httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True)
 
-def make_proxy_url(request: Request, path: str, target_url: str) -> str:
+def make_proxy_url(request: Request, path: str, target_url: str, sid: str = None) -> str:
     """Tạo URL đi qua proxy của chúng ta"""
     proxy_base = str(request.base_url).rstrip("/")
     encoded_target = urllib.parse.quote(target_url, safe="")
-    return f"{proxy_base}{path}?url={encoded_target}"
+    res = f"{proxy_base}{path}?url={encoded_target}"
+    if sid:
+        res += f"&sid={sid}"
+    return res
 
 @app.get("/")
 async def root(request: Request):
@@ -106,8 +128,10 @@ async def root(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
 
 @app.get("/proxy/m3u8")
-async def proxy_m3u8(request: Request, url: str):
+async def proxy_m3u8(request: Request, url: str, sid: str = None):
     """Proxy phân tích m3u8 và viết lại các URL bên trong"""
+    if not sid:
+        sid = hashlib.md5(url.encode()).hexdigest()
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
         response = await client.get(url, headers=headers, follow_redirects=True)
@@ -120,27 +144,27 @@ async def proxy_m3u8(request: Request, url: str):
         if playlist.is_variant:
             for item in playlist.playlists:
                 abs_uri = item.absolute_uri
-                item.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri)
+                item.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri, sid)
             if playlist.iframe_playlists:
                 for iframe in playlist.iframe_playlists:
                     abs_uri = iframe.absolute_uri
-                    iframe.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri)
+                    iframe.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri, sid)
             if playlist.media:
                 for media in playlist.media:
                     if media.uri:
                         abs_uri = media.absolute_uri
-                        media.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri)
+                        media.uri = make_proxy_url(request, "/proxy/m3u8", abs_uri, sid)
                         
         # Phân nhánh 2: Nếu là luồng MEDIA
         else:
             for segment in playlist.segments:
                 abs_uri = segment.absolute_uri
-                segment.uri = make_proxy_url(request, "/proxy/ts", abs_uri)
+                segment.uri = make_proxy_url(request, "/proxy/ts", abs_uri, sid)
                 
             for key in playlist.keys:
                 if key and key.uri:
                     abs_uri = key.absolute_uri
-                    key.uri = make_proxy_url(request, "/proxy/ts", abs_uri)
+                    key.uri = make_proxy_url(request, "/proxy/ts", abs_uri, sid)
                     
         return PlainTextResponse(
             playlist.dumps(), 
@@ -153,77 +177,119 @@ async def proxy_m3u8(request: Request, url: str):
         return PlainTextResponse(f"Proxy Error: {str(e)}", status_code=500)
 
 @app.get("/proxy/ts")
-async def proxy_ts(request: Request, url: str):
-    """Proxy và cache .ts với cơ chế Single Flight chống tải trùng"""
+async def proxy_ts(request: Request, url: str, sid: str = "default"):
+    """Proxy và cache .ts với cơ chế Pass-through Stream và Part-files theo Session"""
+    session_dir = os.path.join(CACHE_DIR, sid)
+    if not os.path.exists(session_dir):
+        os.makedirs(session_dir, exist_ok=True)
+        
     url_hash = hashlib.md5(url.encode()).hexdigest()
-    cache_path = os.path.join(CACHE_DIR, f"{url_hash}.ts")
+    cache_path = os.path.join(session_dir, f"{url_hash}.ts")
+    part_path = os.path.join(session_dir, f"{url_hash}.ts.part")
+    lock_id = f"{sid}_{url_hash}"
     
     # 1. Kiểm tra cache trên đĩa
     if os.path.exists(cache_path):
         return FileResponse(cache_path, media_type="video/MP2T", headers={"X-Cache": "HIT"})
     
     # 2. Cơ chế Single Flight: Kiểm tra xem có ai đang tải đoạn này chưa
-    if url_hash in download_locks:
-        # Đang có người tải, đợi họ tải xong
-        await download_locks[url_hash].wait()
-        # Sau khi đợi xong, file chắc chắn đã có trên đĩa
+    if lock_id in download_locks:
+        await download_locks[lock_id].wait()
         if os.path.exists(cache_path):
             return FileResponse(cache_path, media_type="video/MP2T", headers={"X-Cache": "HIT-QUEUED"})
 
-    # 3. Nếu chưa ai tải, tạo Lock và bắt đầu tải
+    # 3. Tạo Lock và mở Stream tải xuống
     event = asyncio.Event()
-    download_locks[url_hash] = event
+    download_locks[lock_id] = event
     
-    try:
-        resp = await client.get(url)
-        if resp.status_code == 200:
-            async with aiofiles.open(cache_path, "wb") as f:
-                await f.write(resp.content)
-            
-            # Giải phóng cho những yêu cầu đang đợi
+    async def stream_and_cache():
+        try:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    event.set()
+                    yield b""
+                    return
+
+                async with aiofiles.open(part_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes():
+                        await f.write(chunk)
+                        yield chunk
+                
+                # Ghi xong hoàn chỉnh, đổi tên file part thành ts
+                if os.path.exists(part_path):
+                    os.rename(part_path, cache_path)
+                event.set()
+
+        except asyncio.CancelledError:
+            # Khách nhấn tua phim hoặc tắt trình duyệt, hủy luồng ngay lập tức
             event.set()
-            return Response(content=resp.content, media_type="video/MP2T", headers={"X-Cache": "MISS"})
-        else:
-            event.set() # Vẫn phải set để giải phóng hàng chờ cho dù lỗi
-            return PlainTextResponse("Error fetching segment", status_code=resp.status_code)
-    except Exception as e:
-        event.set()
-        logger.error(f"Lỗi tải segment: {e}")
-        return PlainTextResponse(f"Unknown Error: {str(e)}", status_code=500)
-    finally:
-        # Xóa lock sau khi hoàn tất
-        if url_hash in download_locks:
-            del download_locks[url_hash]
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except Exception:
+                    pass
+            raise
+
+        except Exception as e:
+            logger.error(f"Lỗi tải segment: {e}")
+            event.set()
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except Exception:
+                    pass
+            yield b""
+            
+        finally:
+            if lock_id in download_locks:
+                del download_locks[lock_id]
+
+    return StreamingResponse(
+        stream_and_cache(),
+        media_type="video/MP2T",
+        headers={"X-Cache": "MISS"}
+    )
+
+def _calculate_cache_size():
+    total_size = 0
+    for root, _, files in os.walk(CACHE_DIR):
+        for f in files:
+            file_path = os.path.join(root, f)
+            if os.path.isfile(file_path):
+                total_size += os.path.getsize(file_path)
+    return total_size
 
 @app.get("/api/cache/status")
 async def get_cache_status():
-    """Lấy thông tin dung lượng cache hiện tại"""
+    """Lấy thông tin dung lượng cache hiện tại (chống nghẽn Event Loop)"""
     try:
-        total_size = 0
-        for file in os.listdir(CACHE_DIR):
-            file_path = os.path.join(CACHE_DIR, file)
-            if os.path.isfile(file_path):
-                total_size += os.path.getsize(file_path)
-        
+        total_size = await asyncio.to_thread(_calculate_cache_size)
         percent = (total_size / MAX_CACHE_SIZE) * 100
         total_gb = total_size / (1024 * 1024 * 1024)
         
         return {
             "size_gb": round(total_gb, 2),
             "percent": round(percent, 1),
-            "max_gb": 10
+            "max_gb": round(MAX_CACHE_SIZE / (1024**3), 1)
         }
     except Exception as e:
         return {"error": str(e)}
 
+def _clear_all_cache():
+    for item in os.listdir(CACHE_DIR):
+        item_path = os.path.join(CACHE_DIR, item)
+        if os.path.isdir(item_path):
+            try: shutil.rmtree(item_path)
+            except: pass
+        else:
+            try: os.remove(item_path)
+            except: pass
+
 @app.post("/api/cache/clear")
 async def clear_cache_endpoint():
-    """Xóa sạch bộ nhớ đêm ngay lập tức"""
+    """Xóa sạch bộ nhớ đêm ngay lập tức (chống nghẽn Event Loop)"""
     try:
-        for file in os.listdir(CACHE_DIR):
-            file_path = os.path.join(CACHE_DIR, file)
-            if os.path.isfile(file_path):
-                os.remove(file_path)
+        await asyncio.to_thread(_clear_all_cache)
         return {"status": "success", "message": "Đã dọn sạch cache."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
